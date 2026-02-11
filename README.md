@@ -10,6 +10,7 @@
 ### 📥 安裝與 Clone
 
 將專案 Clone 到 `.openclaw/workspace` 目錄下：
+務必要存到這個資料夾底下，否則系統文檔就會因為路徑不同而無法看到。
 
 ```bash
 mkdir -p .openclaw/workspace
@@ -34,7 +35,7 @@ chmod +x start.sh && ./start.sh
 
 啟動後，請與 OpenClaw 溝通，下達以下指令以建立長期記憶：
 
-> "請去 `.openclaw/workspace/ClawDashboard/backend/docs` 讀取裡面的兩篇 `.md` 檔案，做相應的處理並且存入長記憶中。"
+> "請去 `.openclaw/workspace/ClawDashboard/backend/docs` 讀取裡面的兩篇 `.md` 檔案，做相應的處理並且把所有觸發的方式跟流程存入長記憶中。"
 
 
 ---
