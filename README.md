@@ -37,35 +37,6 @@ chmod +x start.sh && ./start.sh
 
 > "請去 `.openclaw/workspace/ClawDashboard/backend/docs` 讀取裡面的兩篇 `.md` 檔案，做相應的處理並且把所有觸發的方式跟流程存入長記憶中。"
 
-
----
-
-### 🛠️ 手動安裝與啟動
-
-如果你偏好手動控制：
-
-**1. 啟動後端 (Backend)**
-
-```bash
-cd backend
-npm install
-# 確保 .env 存在 (可參考 .env.example)
-cp .env.example .env
-node server.js
-```
-
-後端預設運行在 `http://localhost:3001`。
-
-**2. 啟動前端 (Frontend)**
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-前端預設運行在 `http://localhost:5173`。
-
 ---
 
 ## 🏗️ 系統架構
