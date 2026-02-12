@@ -7,7 +7,7 @@ const ModelUsage = () => {
   useEffect(() => {
     const fetchModels = async () => {
       try {
-        const res = await fetch('http://localhost:3001/api/models');
+        const res = await fetch(`http://${window.location.hostname}:3001/api/models`);
         const json = await res.json();
         if (json.success) {
           const filtered = json.data.filter(m => !m.model.toLowerCase().includes('opus'));

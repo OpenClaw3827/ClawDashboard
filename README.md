@@ -31,125 +31,203 @@ chmod +x start.sh && ./start.sh
 啟動後會自動開啟瀏覽器，訪問 `http://localhost:5173`。
 
 
-### 🧠 初始化長期記憶 (Long Memory Init)
-
-啟動後，請與 OpenClaw 溝通，下達以下指令以建立長期記憶：
-
-> "請去 `.openclaw/workspace/ClawDashboard/backend/docs` 讀取裡面的兩篇 `.md` 檔案，做相應的處理並且把所有觸發的方式跟流程存入長記憶中。"
-
----
-
 ## 🏗️ 系統架構
 
-```mermaid
-graph TD
-    Client["Frontend (React/Vite)"] <-->|API| Server["Backend (Express)"]
-    Server <-->|SQL| DB[("SQLite: bot.db")]
-    Server <-->|File System| Docs["Docs Directory"]
-    
-    subgraph Core Logic
-    Server -- Status Flow --> Status["User Status"]
-    Server -- Webhook --> Task["Task Management"]
-    end
+```
+OpenClaw Gateway (ws://127.0.0.1:18789)
+  │
+  │  WebSocket: agent lifecycle events
+  ▼
+Dashboard Bridge (backend/bridge/)
+  │  即時同步 agent 狀態 + 斷線恢復偵測
+  │
+  │  PUT /api/agents/:name/status
+  ▼
+Dashboard Backend (Express + SQLite, port 3001)
+  │  API 認證 (Bearer Token) + SSE 即時廣播
+  │
+  │  SSE: agentStatusUpdated / statusUpdated / tasksUpdated
+  ▼
+Dashboard Frontend (React + Vite, port 5173)
+    即時更新 agent 狀態面板 + 任務看板
 ```
 
----
+### 三個服務（launchd 自動啟動）
 
-## 🧩 核心概念與工作流
+| 服務 | Label | Port | 說明 |
+|------|-------|------|------|
+| Backend | `com.clawdashboard.backend` | 3001 | Express API + SQLite + SSE |
+| Frontend | `com.clawdashboard.frontend` | 5173 | React + Vite dev server |
+| Bridge | `com.clawdashboard.bridge` | — | Gateway WS → Dashboard 同步 |
 
-### 1. Status Flow (狀態燈)
 
-系統透過狀態燈即時反映 Agent 目前的運作情形。
+## 🔄 自動同步功能
 
-- **三種狀態**：
-    - `idle`: 閒置中，等待指令。
-    - `thinking`: 收到任務，正在規劃或思考。
-    - `acting`: 正在執行具體操作。
-- **自動化規則**：
-    1.  收到任務 → 狀態轉為 `thinking`
-    2.  開始執行 → 狀態轉為 `acting`
-    3.  任務完成 → 狀態回歸 `idle`
+### Agent 狀態自動同步
 
-### 2. Long Memory & Task Flow (長期記憶與任務看板)
+Bridge daemon 連接 OpenClaw Gateway WebSocket，即時接收 agent lifecycle events：
 
-所有的對話與指令都會被轉化為結構化的 Task，並記錄在看板上。
+| Gateway Event | → Dashboard State | 說明 |
+|---|---|---|
+| lifecycle start | `thinking` | Agent 開始處理任務 |
+| lifecycle end | `standby` | Agent 完成任務 |
+| lifecycle error | `error` | Agent 發生錯誤 |
 
-- **Task 建立規則**：
-    - **Title**: 摘要（第一行，≤120字）
-    - **Description**: 全文內容
-- **狀態流轉**：
-    - `todo` (Received): 收到 Webhook 請求
-    - `in_progress` (Started): 任務開始執行
-    - `done` (Completed): 任務結束
+**三層防護**：
+1. **WebSocket 即時**（毫秒級）：lifecycle events 直接推送
+2. **HTTP Polling 備援**（10 秒）：WS 斷線時自動切換
+3. **Stale 清理**（1 分鐘）：交叉比對 Gateway 與 Dashboard，清理幽靈狀態
 
-### 3. Docs System (文件系統)
+### 任務自動完成
 
-文件是 Agent 知識與記憶的載體。
+- Agent 正常歸隊（standby）→ 其 `in_progress` 任務自動標記 `done`
+- Agent 異常斷線（stale cleanup）→ 任務保持 `in_progress`，不會誤判完成
+- 任務需要 `assigned_agent` 欄位才會觸發自動完成
 
-- **Workspace Root**: `path.join(__dirname, '../../..', 'workspace')`
-- **分類**：
-    - **System**: Workspace 下的 `.md` 文件（唯讀）
-    - **Docs**: `backend/docs` 目錄下的文件（可讀寫，用於記錄 Integration Log 等）
+### 斷線恢復機制
 
----
+當 Bridge 偵測到 agent 異常斷線且有未完成任務時：
+1. 任務標記 `⚠️ Agent stale/disconnected`
+2. 自動叫醒主 agent（華安）進行恢復
+3. 主 agent 讀取舊 session 紀錄，重新派工並附上進度摘要
 
-## 🔌 API 參考文獻
+恢復 API：`GET /api/tasks/recovery`（回傳所有需要恢復的任務）
+
+
+## 🔒 安全機制
+
+### API 認證
+
+所有寫入端點（PUT/POST/DELETE）需要 Bearer Token 認證：
+
+```bash
+curl -X PUT http://localhost:3001/api/agents/main/status \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"state":"acting","task":"工作中"}'
+```
+
+Token 設定在 `backend/.env`：
+```
+DASHBOARD_API_TOKEN=your-token-here
+```
+
+若不設 token（空值），則跳過認證（開發模式）。
+
+### 路徑安全
+
+Docs API 有路徑遍歷保護（`../` 攻擊會被 403 擋下）。
+
+
+## 🧩 核心概念
+
+### Status Flow（狀態燈）
+
+- **`idle`**：閒置中（綠色）
+- **`thinking`**：思考中（黃色）
+- **`acting`**：執行中（紅色）
+- **`error`**：錯誤（紅色閃爍）
+
+全局狀態由所有 agent 狀態自動聚合：任一 acting → acting；任一 thinking → thinking；否則 idle。
+
+### Task Flow（任務看板）
+
+```
+todo → in_progress → done
+              ↑          ↑
+        手動/派工    agent standby（自動）
+```
+
+任務欄位：
+- `title`：任務標題
+- `status`：todo / in_progress / done
+- `assigned_agent`：指派的 agent（自動完成用）
+- `session_key`：對應的 OpenClaw session（斷線恢復用）
+
+### Frontend 即時更新
+
+前端優先使用 SSE（Server-Sent Events）接收即時更新，15 秒 polling 作為 fallback：
+- `agentStatusUpdated`：單一 agent 狀態變更
+- `statusUpdated`：全局狀態變更
+- `tasksUpdated`：任務看板變更
+
+
+## 🔌 API 參考
 
 ### Status API
 
-管理 Agent 的當前狀態。
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/status` | 獲取當前狀態與活躍 Agent |
-| `PUT` | `/api/status` | 更新狀態 (`state`: `idle`/`thinking`/`acting`) |
-
-### Task API
-
-任務看板的 CRUD 操作。
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/tasks` | 獲取任務列表 |
-| `POST` | `/api/tasks` | 建立新任務 |
-| `PUT` | `/api/tasks/:id` | 更新任務內容或狀態 |
-
-### Webhook API (自動化驅動)
-
-外部系統透過此接口驅動 Dashboard 的狀態與任務流轉。
-
-- **Endpoint**: `POST /api/webhook/message`
-- **Payload**:
-  ```json
-  {
-    "text": "...",         // 任務內容
-    "stage": "received",   // 階段: received | started | completed
-    "taskId": "optional"   // 用於追蹤同一任務的後續階段
-  }
-  ```
-- **行為對應**:
-    - `received` → 建立 `todo` Task
-    - `started` → 更新 Task 為 `in_progress`
-    - `completed` → 更新 Task 為 `done`
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/api/status` | — | 獲取全局狀態 |
+| `PUT` | `/api/status` | ✅ | 更新全局狀態 |
 
 ### Agent API
 
-- **Endpoint**: `GET /api/agents`
-- **Description**: 讀取 `openclaw.json` (位於 Workspace 上層)，回傳可用 Agent 列表。
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/api/agents` | — | 從 openclaw.json 讀取 agent 列表 |
+| `GET` | `/api/agents/status` | — | 所有 agent 即時狀態 |
+| `PUT` | `/api/agents/:name/status` | ✅ | 更新 agent 狀態（支援 `source` 參數） |
 
----
+### Task API
 
-## ⚙️ 環境變數 (Environment Variables)
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/api/tasks` | — | 任務列表 |
+| `POST` | `/api/tasks` | ✅ | 建立任務（支援 `assigned_agent`, `session_key`） |
+| `PUT` | `/api/tasks/:id` | ✅ | 更新任務 |
+| `DELETE` | `/api/tasks/:id` | ✅ | 刪除任務 |
+| `GET` | `/api/tasks/recovery` | — | 需要恢復的任務列表 |
 
-設定檔位於 `backend/.env`：
+### Webhook API
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/api/webhook/message` | ✅ | 外部觸發任務流轉 |
+
+### SSE Events
+
+| Event | Endpoint | Description |
+|-------|----------|-------------|
+| `GET` | `/api/events` | SSE 事件流 |
+
+事件類型：`agentStatusUpdated`、`statusUpdated`、`tasksUpdated`、`docsUpdated`
+
+
+## ⚙️ 環境變數
+
+設定檔：`backend/.env`
 
 | 變數 | 預設值 | 說明 |
-| :--- | :--- | :--- |
-| `PORT` | 3001 | Backend 服務端口 |
-| `DB_PATH` | bot.db | SQLite 資料庫路徑 |
-| `DOCS_DIR` | docs | 文件存放目錄名稱 |
+|------|--------|------|
+| `PORT` | `3001` | Backend 端口 |
+| `DB_PATH` | `bot.db` | SQLite 資料庫路徑 |
+| `DOCS_DIR` | `docs` | 文件存放目錄 |
+| `DASHBOARD_API_TOKEN` | (空) | API 認證 token（空=跳過認證） |
+| `OPENCLAW_CONFIG` | `~/.openclaw/openclaw.json` | OpenClaw 配置檔路徑 |
 
----
+Bridge 額外環境變數（由 `run-bridge.sh` 自動設定）：
+
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `OPENCLAW_GATEWAY_URL` | `ws://127.0.0.1:18789` | Gateway WebSocket URL |
+| `OPENCLAW_GATEWAY_TOKEN` | (從 openclaw.json 讀取) | Gateway token |
+| `DASHBOARD_API_URL` | `http://127.0.0.1:3001` | Dashboard Backend URL |
+
+
+## 🛠️ 開發
+
+```bash
+# Backend（熱重載）
+cd backend && npm run dev
+
+# Frontend（Vite HMR）
+cd frontend && npm run dev
+
+# Bridge（手動測試）
+cd backend && bash bridge/run-bridge.sh
+```
+
 
 ## 📝 License
 

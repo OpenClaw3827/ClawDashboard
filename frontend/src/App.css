@@ -238,6 +238,12 @@ a:hover {
   animation: pulse-red 2s infinite;
 }
 
+.status-error {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+  animation: blink-error 1s infinite;
+}
+
 .status-offline {
   background: #6b7280;
 }
@@ -281,6 +287,17 @@ a:hover {
 
   100% {
     box-shadow: 0 0 0 0px rgba(239, 68, 68, 0);
+  }
+}
+
+@keyframes blink-error {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 12px var(--red);
+  }
+  50% {
+    opacity: 0.3;
+    box-shadow: 0 0 4px var(--red);
   }
 }
 

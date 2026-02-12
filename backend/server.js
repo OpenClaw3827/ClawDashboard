@@ -5,13 +5,13 @@ const fs = require('fs-extra');
 const path = require('path');
 const multer = require('multer');
 const EventEmitter = require('events');
-
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // OpenClaw config (for agent list)
-const OPENCLAW_CONFIG = process.env.OPENCLAW_CONFIG || path.join(__dirname, '../../..', 'openclaw.json');
+const OPENCLAW_CONFIG = process.env.OPENCLAW_CONFIG || path.join(require('os').homedir(), '.openclaw', 'openclaw.json');
 
 // ========== REALTIME EVENTS (SSE) ==========
 const events = new EventEmitter();
@@ -93,6 +93,20 @@ function loadAgentsFromConfig() {
     const raw = fs.readFileSync(OPENCLAW_CONFIG, 'utf8');
     const cfg = JSON.parse(raw);
     const agents = cfg?.agents || {};
+
+    // OpenClaw format: agents.list is an array of { id, name, identity, ... }
+    if (Array.isArray(agents.list)) {
+      return agents.list
+        .filter(a => a.id && a.id !== 'defaults')
+        .map(a => ({
+          id: a.id,
+          name: a.identity?.name || a.name || a.id,
+          role: a.role || a.identity?.theme || '',
+          emoji: a.identity?.emoji || a.emoji || '🤖'
+        }));
+    }
+
+    // Fallback: agents is a key-value object
     const names = Object.keys(agents).filter(k => k !== 'defaults');
     return names.map(name => ({ name }));
   } catch (e) {
@@ -100,11 +114,33 @@ function loadAgentsFromConfig() {
   }
 }
 
+// ========== AUTH MIDDLEWARE ==========
+const authMiddleware = (req, res, next) => {
+  const apiToken = process.env.DASHBOARD_API_TOKEN;
+  
+  // Skip auth if no token configured (dev convenience)
+  if (!apiToken || apiToken === '') {
+    return next();
+  }
+  
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  }
+  
+  const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+  if (token !== apiToken) {
+    return res.status(401).json({ error: 'Invalid API token' });
+  }
+  
+  next();
+};
+
 // ========== MIDDLEWARE ==========
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (like curl) or from localhost
-    if (!origin || origin.startsWith('http://localhost')) {
+    // Allow requests with no origin (like curl), localhost, or LAN
+    if (!origin || origin.startsWith('http://localhost') || origin.startsWith('http://192.168.')) {
       return callback(null, true);
     }
     callback(new Error('Not allowed by CORS'));
@@ -245,11 +281,23 @@ const initDatabase = async () => {
       )
     `);
 
+    // Per-agent status table (supports multiple agents active simultaneously)
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS agent_status (
+        agent_name TEXT PRIMARY KEY,
+        state TEXT DEFAULT 'standby',
+        task TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Migrations: Add columns if missing (safe to run multiple times)
     try { await dbRun('ALTER TABLE status ADD COLUMN active_agent TEXT DEFAULT \'Claw\''); } catch (e) { }
     try { await dbRun('ALTER TABLE status ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP'); } catch (e) { }
     try { await dbRun('ALTER TABLE documents ADD COLUMN is_pinned INTEGER DEFAULT 0'); } catch (e) { }
     try { await dbRun('ALTER TABLE documents ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch (e) { }
+    try { await dbRun('ALTER TABLE tasks ADD COLUMN assigned_agent TEXT DEFAULT NULL'); } catch (e) { }
+    try { await dbRun('ALTER TABLE tasks ADD COLUMN session_key TEXT DEFAULT NULL'); } catch (e) { }
 
     // Insert initial status if not exists
     await dbRun(`INSERT OR IGNORE INTO status (id, state) VALUES (1, 'idle')`);
@@ -282,6 +330,104 @@ app.get('/api/agents', async (req, res) => {
   }
 });
 
+// ========== AGENT STATUS HELPER ==========
+async function setAgentStatus({ agentName, state, task, source = 'normal' }) {
+  // Upsert agent_status
+  await dbRun(
+    `INSERT INTO agent_status (agent_name, state, task, updated_at)
+     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(agent_name) DO UPDATE SET state = ?, task = ?, updated_at = CURRENT_TIMESTAMP`,
+    [agentName, state, task, state, task]
+  );
+  
+  // Broadcast agent-specific update
+  broadcast('agentStatusUpdated', { agent: agentName, state, task });
+
+  // Auto-complete tasks: only on normal standby, NOT stale cleanup
+  if (state === 'standby' && source !== 'stale') {
+    const inProgressTasks = await dbQuery(
+      "SELECT id, title FROM tasks WHERE assigned_agent = ? AND status = 'in_progress'",
+      [agentName]
+    );
+    for (const task of inProgressTasks) {
+      await dbRun(
+        "UPDATE tasks SET status = 'done', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [task.id]
+      );
+      console.log(`[AutoComplete] Task #${task.id} "${task.title}" → done (agent ${agentName} standby)`);
+      broadcast('tasksUpdated', { taskId: task.id, status: 'done', source: 'auto-complete' });
+    }
+  }
+
+  // Mark tasks for recovery when agent goes to error state
+  if (state === 'error') {
+    const tasks = await dbQuery(
+      "SELECT id, title FROM tasks WHERE assigned_agent = ? AND status = 'in_progress'",
+      [agentName]
+    );
+    for (const task of tasks) {
+      await dbRun(
+        "UPDATE tasks SET description = description || '\n⚠️ Agent error at ' || CURRENT_TIMESTAMP WHERE id = ?",
+        [task.id]
+      );
+      console.log(`[Recovery] Task #${task.id} agent error, marked for recovery`);
+    }
+  }
+
+  // Mark tasks for recovery when agent goes stale/disconnected
+  if (state === 'standby' && source === 'stale') {
+    const tasks = await dbQuery(
+      "SELECT id, title FROM tasks WHERE assigned_agent = ? AND status = 'in_progress'",
+      [agentName]
+    );
+    for (const task of tasks) {
+      await dbRun(
+        "UPDATE tasks SET description = description || '\n⚠️ Agent stale/disconnected at ' || CURRENT_TIMESTAMP WHERE id = ?",
+        [task.id]
+      );
+      console.log(`[Recovery] Task #${task.id} agent went stale, needs recovery`);
+    }
+  }
+
+  // Calculate global state: if any agent is acting → acting, any thinking → thinking, else idle
+  const active = await dbQuery("SELECT state FROM agent_status WHERE state IN ('acting', 'thinking')");
+  const globalState = active.some(r => r.state === 'acting') ? 'acting'
+    : active.some(r => r.state === 'thinking') ? 'thinking' : 'idle';
+  
+  // Update global status
+  await dbRun('UPDATE status SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1', [globalState]);
+  
+  // Broadcast global status update
+  broadcast('statusUpdated', { state: globalState });
+  
+  return { agentName, state, task, globalState };
+}
+
+// ========== PER-AGENT STATUS (multi-agent simultaneous) ==========
+app.get('/api/agents/status', async (req, res) => {
+  try {
+    const rows = await dbQuery('SELECT agent_name, state, task, updated_at FROM agent_status');
+    const map = {};
+    for (const r of rows) {
+      map[r.agent_name] = { state: r.state, task: r.task, updatedAt: r.updated_at };
+    }
+    res.json({ success: true, data: map });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/agents/:name/status', authMiddleware, async (req, res) => {
+  const { name } = req.params;
+  const { state = 'standby', task, source = 'normal' } = req.body;
+  try {
+    const result = await setAgentStatus({ agentName: name, state, task, source });
+    res.json({ success: true, agent: name, state, task, globalState: result.globalState });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== STATUS ENDPOINTS ==========
 app.get('/api/status', async (req, res) => {
   try {
@@ -298,7 +444,7 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
-app.put('/api/status', async (req, res) => {
+app.put('/api/status', authMiddleware, async (req, res) => {
   const { state, status, activeAgent } = req.body;
   const nextState = state ?? status;
 
@@ -337,7 +483,7 @@ app.get('/api/models', async (req, res) => {
   }
 });
 
-app.post('/api/models', async (req, res) => {
+app.post('/api/models', authMiddleware, async (req, res) => {
   const { provider, model, usage_pct, cd_reset } = req.body;
   if (!provider || !model) {
     return res.status(400).json({ error: 'Missing provider or model' });
@@ -357,15 +503,16 @@ app.post('/api/models', async (req, res) => {
 });
 
 // ========== WEBHOOK (Messages -> Tasks) ==========
-app.post('/api/webhook/message', async (req, res) => {
+app.post('/api/webhook/message', authMiddleware, async (req, res) => {
   const { text = '', stage = 'received' } = req.body || {};
   const summary = String(text).trim().split('\n')[0].slice(0, 120) || 'New task';
 
   try {
     if (stage === 'received') {
+      const { assigned_agent, session_key } = req.body || {};
       const result = await dbRun(
-        'INSERT INTO tasks (title, description, status, priority) VALUES (?, ?, ?, ?)',
-        [summary, text, 'todo', 'medium']
+        'INSERT INTO tasks (title, description, status, priority, assigned_agent, session_key) VALUES (?, ?, ?, ?, ?, ?)',
+        [summary, text, 'todo', 'medium', assigned_agent, session_key]
       );
       await addLog('Task Created (Webhook)', summary, 'task');
       const row = await dbGet('SELECT * FROM tasks WHERE id = ?', [result.lastID]);
@@ -398,12 +545,12 @@ app.get('/api/tasks', async (req, res) => {
   }
 });
 
-app.post('/api/tasks', async (req, res) => {
-  const { title, description, status = 'todo', priority = 'medium' } = req.body;
+app.post('/api/tasks', authMiddleware, async (req, res) => {
+  const { title, description, status = 'todo', priority = 'medium', assigned_agent, session_key } = req.body;
   try {
     const result = await dbRun(
-      'INSERT INTO tasks (title, description, status, priority) VALUES (?, ?, ?, ?)',
-      [title, description, status, priority]
+      'INSERT INTO tasks (title, description, status, priority, assigned_agent, session_key) VALUES (?, ?, ?, ?, ?, ?)',
+      [title, description, status, priority, assigned_agent, session_key]
     );
     await addLog('Task Created', `New task: ${title}`, 'task');
     const row = await dbGet('SELECT * FROM tasks WHERE id = ?', [result.lastID]);
@@ -414,9 +561,9 @@ app.post('/api/tasks', async (req, res) => {
   }
 });
 
-app.put('/api/tasks/:id', async (req, res) => {
+app.put('/api/tasks/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
-  const { status, checked, title, description, priority } = req.body;
+  const { status, checked, title, description, priority, assigned_agent, session_key } = req.body;
 
   try {
     const updates = [];
@@ -427,6 +574,8 @@ app.put('/api/tasks/:id', async (req, res) => {
     if (priority !== undefined) { updates.push('priority = ?'); values.push(priority); }
     if (status !== undefined) { updates.push('status = ?'); values.push(status); }
     if (checked !== undefined) { updates.push('checked = ?'); values.push(checked ? 1 : 0); }
+    if (assigned_agent !== undefined) { updates.push('assigned_agent = ?'); values.push(assigned_agent); }
+    if (session_key !== undefined) { updates.push('session_key = ?'); values.push(session_key); }
 
     if (updates.length === 0) return res.json({ success: true });
 
@@ -441,7 +590,7 @@ app.put('/api/tasks/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/tasks/:id', async (req, res) => {
+app.delete('/api/tasks/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     await dbRun('DELETE FROM tasks WHERE id = ?', [id]);
@@ -453,8 +602,26 @@ app.delete('/api/tasks/:id', async (req, res) => {
   }
 });
 
+// Recovery endpoint: tasks that need recovery (in_progress but agent is standby/error)
+app.get('/api/tasks/recovery', async (req, res) => {
+  try {
+    const tasks = await dbQuery(`
+      SELECT t.id, t.title, t.description, t.assigned_agent, t.session_key, t.status,
+             COALESCE(a.state, 'unknown') as agent_state
+      FROM tasks t
+      LEFT JOIN agent_status a ON t.assigned_agent = a.agent_name
+      WHERE t.status = 'in_progress'
+        AND t.assigned_agent IS NOT NULL
+        AND (a.state IS NULL OR a.state IN ('standby', 'error'))
+    `);
+    res.json({ success: true, data: tasks });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== DOCUMENTS ENDPOINTS ==========
-app.put('/api/docs/file', async (req, res) => {
+app.put('/api/docs/file', authMiddleware, async (req, res) => {
   const { id, title, content } = req.body || {};
   if (!id) return res.status(400).json({ error: 'id required' });
   try {
@@ -536,7 +703,7 @@ app.get('/api/docs', async (req, res) => {
   }
 });
 
-app.put('/api/docs/:id/pin', async (req, res) => {
+app.put('/api/docs/:id/pin', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { is_pinned } = req.body;
   try {
@@ -551,7 +718,7 @@ app.put('/api/docs/:id/pin', async (req, res) => {
   }
 });
 
-app.put('/api/docs/reorder', async (req, res) => {
+app.put('/api/docs/reorder', authMiddleware, async (req, res) => {
   const { orders } = req.body;
   if (!orders || !Array.isArray(orders)) {
     return res.status(400).json({ error: 'Missing or invalid orders array' });
@@ -569,7 +736,7 @@ app.put('/api/docs/reorder', async (req, res) => {
   }
 });
 
-app.post('/api/docs', async (req, res) => {
+app.post('/api/docs', authMiddleware, async (req, res) => {
   const { title, content, category = 'Guide', writePath } = req.body;
   try {
     if (writePath) {
@@ -597,14 +764,28 @@ app.get('/api/docs/content', async (req, res) => {
   try {
     if (String(id || '').startsWith('file:')) {
       const rel = String(id).replace(/^file:/, '');
-      const full = path.join(WORKSPACE_ROOT, rel);
+      const full = path.resolve(path.join(WORKSPACE_ROOT, rel));
+      const resolvedWorkspace = path.resolve(WORKSPACE_ROOT);
+      
+      // Path traversal protection
+      if (!full.startsWith(resolvedWorkspace)) {
+        return res.status(403).json({ error: 'Path traversal blocked' });
+      }
+      
       const content = await fs.readFile(full, 'utf8');
       return res.json({ content });
     }
 
     if (String(id || '').startsWith('docs:')) {
       const name = String(id).replace(/^docs:/, '');
-      const full = path.join(docsDir, name);
+      const full = path.resolve(path.join(docsDir, name));
+      const resolvedDocsDir = path.resolve(docsDir);
+      
+      // Path traversal protection
+      if (!full.startsWith(resolvedDocsDir)) {
+        return res.status(403).json({ error: 'Path traversal blocked' });
+      }
+      
       const content = await fs.readFile(full, 'utf8');
       return res.json({ content });
     }
@@ -626,7 +807,7 @@ app.get('/api/docs/content', async (req, res) => {
   }
 });
 
-app.put('/api/docs/:id', async (req, res) => {
+app.put('/api/docs/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { title, content, category } = req.body;
 
@@ -666,7 +847,7 @@ app.put('/api/docs/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/docs/:id', async (req, res) => {
+app.delete('/api/docs/:id', authMiddleware, async (req, res) => {
   const { id } = req.params;
   try {
     if (String(id).startsWith('file:')) {
@@ -725,7 +906,7 @@ app.get('/api/sync/export', async (req, res) => {
   }
 });
 
-app.post('/api/sync/import', async (req, res) => {
+app.post('/api/sync/import', authMiddleware, async (req, res) => {
   const { data, strategy = 'last-write-wins' } = req.body;
   if (!data) return res.status(400).json({ error: 'No data provided' });
 
@@ -857,7 +1038,7 @@ app.get('/api/sync/status', async (req, res) => {
 const startServer = async () => {
   await initDatabase();
 
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`Dashboard Backend running on port ${PORT}`);
     console.log(`Database: SQLite (${dbPath})`);
     console.log(`Storage: Local (${docsDir})`);

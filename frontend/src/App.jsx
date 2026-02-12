@@ -16,26 +16,67 @@ function AppContent() {
   const [isConnected, setIsConnected] = useState(true);
   const [lastSync, setLastSync] = useState(new Date());
   const [agents, setAgents] = useState([]);
+  const [agentStatuses, setAgentStatuses] = useState({});
   const { t, lang, setLang } = useTranslation();
 
   useEffect(() => {
-    // Poll status from backend
-    const interval = setInterval(async () => {
+    // Poll status + per-agent statuses from backend
+    const poll = async () => {
       try {
-        const res = await fetch(`${API_BASE_URL}/api/status`);
-        if (!res.ok) throw new Error('Disconnected');
-        const data = await res.json();
+        const [statusRes, agentStatusRes] = await Promise.all([
+          fetch(`${API_BASE_URL}/api/status`),
+          fetch(`${API_BASE_URL}/api/agents/status`)
+        ]);
+        if (!statusRes.ok) throw new Error('Disconnected');
+        const data = await statusRes.json();
         setStatus(data.status || 'idle');
         setActiveAgent(data.activeAgent || 'Claw');
         setIsConnected(true);
         setLastSync(new Date());
+
+        if (agentStatusRes.ok) {
+          const asData = await agentStatusRes.json();
+          setAgentStatuses(asData?.data || {});
+        }
       } catch (err) {
         console.error('Failed to fetch status:', err);
         setIsConnected(false);
       }
-    }, 3000);
+    };
+    poll();
+    const interval = setInterval(poll, 15000);
 
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    // SSE connection for real-time updates
+    const es = new EventSource(`${API_BASE_URL}/api/events`);
+    
+    es.addEventListener('message', (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.event === 'agentStatusUpdated') {
+          const { agent, state, task } = msg.data;
+          setAgentStatuses(prev => ({
+            ...prev,
+            [agent]: { state, task, updatedAt: msg.ts }
+          }));
+        }
+        if (msg.event === 'statusUpdated') {
+          setStatus(msg.data.state || msg.data.status || 'idle');
+          setActiveAgent(msg.data.activeAgent || 'Claw');
+        }
+      } catch (err) {
+        console.error('SSE parse error:', err);
+      }
+    });
+
+    es.onerror = () => {
+      console.warn('SSE connection lost, falling back to polling');
+    };
+
+    return () => es.close();
   }, []);
 
   useEffect(() => {
@@ -66,6 +107,7 @@ function AppContent() {
     const s = (status || 'idle').toLowerCase();
     if (s === 'thinking') return 'status-idle'; // Yellow
     if (s === 'acting') return 'status-busy';   // Red
+    if (s === 'error') return 'status-error';   // Red (error state)
     return 'status-online';                      // Green (Idle)
   };
 
@@ -73,6 +115,7 @@ function AppContent() {
     const s = (status || 'idle').toLowerCase();
     if (s === 'thinking') return t('app.thinking');
     if (s === 'acting') return t('app.acting');
+    if (s === 'error') return '錯誤';
     return t('app.idle');
   };
 
@@ -80,19 +123,37 @@ function AppContent() {
     return isConnected ? 'status-online' : 'status-busy'; // Green/Red
   };
 
-  const getAgentLabel = (isActive, statusStr) => {
-    if (!isActive) return t('app.agentStandby');
-    return statusStr.toLowerCase() === 'thinking' ? t('app.agentThinking') : t('app.agentActing');
+  const getAgentLabel = (agentState) => {
+    const s = (agentState || 'standby').toLowerCase();
+    if (s === 'thinking') return t('app.agentThinking');
+    if (s === 'acting') return t('app.agentActing');
+    if (s === 'error') return '錯誤';
+    return t('app.agentStandby');
   };
 
   const agentsOnDuty = (agents || []).map(a => {
-    const isActive = activeAgent === a.name && status.toLowerCase() !== 'idle';
+    // Use id for API lookups, name for display
+    const agentId = a.id || a.name;
+    const displayName = a.name || a.id || 'Agent';
+
+    // Per-agent status from new API (multi-agent support)
+    const perAgent = agentStatuses[agentId];
+    const agentState = perAgent?.state || 'standby';
+    const isBusy = agentState === 'acting' || agentState === 'thinking';
+
+    // Fallback: also check legacy single-agent activeAgent field
+    const legacyActive = activeAgent === agentId && status.toLowerCase() !== 'idle';
+    const finalBusy = isBusy || legacyActive;
+    const finalState = isBusy ? agentState : (legacyActive ? status.toLowerCase() : 'standby');
+
     return {
-      name: a.name,
+      id: agentId,
+      name: displayName,
       role: a.role || 'Agent',
       emoji: a.emoji || '🤖',
-      status: isActive ? 'busy' : 'standby',
-      label: getAgentLabel(isActive, status)
+      status: finalBusy ? 'busy' : 'standby',
+      label: getAgentLabel(finalState),
+      task: perAgent?.task || ''
     };
   });
 
@@ -142,7 +203,7 @@ function AppContent() {
                   <span className="agent-emoji">{agent.emoji}</span>
                   <div className="agent-info">
                     <span className="agent-name">{agent.name}</span>
-                    <span className="agent-role">{agent.label}</span>
+                    <span className="agent-role">{agent.task || agent.label}</span>
                   </div>
                   <div className={`agent-status-dot ${agent.status}`}></div>
                 </div>
